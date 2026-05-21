@@ -1,0 +1,391 @@
+-- Modelagem de Banco de Dados — Plataforma "Simulador ENEM"
+-- Alunos: Nicolas Dellani, Kauane Mota e Erika Figueiredo
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- TABELA DE USUÁRIOS / PERFIS
+
+CREATE TABLE usuarios (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    nome_completo VARCHAR(255) NOT NULL,
+
+    papel VARCHAR(30) NOT NULL DEFAULT 'ALUNO',
+
+    criado_em TIMESTAMP DEFAULT NOW(),
+
+    CONSTRAINT chk_papel
+    CHECK (
+        papel IN (
+            'ALUNO',
+            'ADMIN_ESCOLAR',
+            'ADMIN_GLOBAL'
+        )
+    )
+);
+
+-- TABELA ESCOLAS
+
+CREATE TABLE escolas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    nome VARCHAR(255) NOT NULL,
+
+    cnpj VARCHAR(18) NOT NULL UNIQUE,
+
+    administrador_id UUID NOT NULL,
+
+    criado_em TIMESTAMP DEFAULT NOW(),
+
+    CONSTRAINT fk_admin_escola
+    FOREIGN KEY (administrador_id)
+    REFERENCES usuarios(id)
+    ON DELETE CASCADE
+);
+
+-- MATRÍCULAS
+
+CREATE TABLE matriculas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    aluno_id UUID NOT NULL,
+
+    escola_id UUID NOT NULL,
+
+    data_matricula TIMESTAMP DEFAULT NOW(),
+
+    CONSTRAINT fk_aluno
+    FOREIGN KEY (aluno_id)
+    REFERENCES usuarios(id)
+    ON DELETE CASCADE,
+
+    CONSTRAINT fk_escola
+    FOREIGN KEY (escola_id)
+    REFERENCES escolas(id)
+    ON DELETE CASCADE,
+
+    CONSTRAINT unq_matricula
+    UNIQUE (aluno_id, escola_id)
+);
+
+-- QUESTÕES
+
+CREATE TABLE questoes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    numero_identificacao INTEGER NOT NULL UNIQUE,
+
+    enunciado JSONB NOT NULL,
+
+    alternativas JSONB NOT NULL,
+
+    alternativa_correta INTEGER NOT NULL,
+
+    criado_em TIMESTAMP DEFAULT NOW()
+);
+
+-- SESSÕES DE SIMULADO
+
+CREATE TABLE sessoes_simulado (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    aluno_id UUID NOT NULL,
+
+    iniciado_em TIMESTAMP DEFAULT NOW(),
+
+    finalizado_em TIMESTAMP,
+
+    status VARCHAR(20) DEFAULT 'EM_ANDAMENTO',
+
+    total_questoes INTEGER DEFAULT 0,
+
+    total_acertos INTEGER DEFAULT 0,
+
+    CONSTRAINT fk_aluno_sessao
+    FOREIGN KEY (aluno_id)
+    REFERENCES usuarios(id)
+    ON DELETE CASCADE,
+
+    CONSTRAINT chk_status_sessao
+    CHECK (
+        status IN (
+            'EM_ANDAMENTO',
+            'CONCLUIDA'
+        )
+    )
+);
+
+-- RESPOSTAS
+
+CREATE TABLE respostas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+    sessao_id UUID NOT NULL,
+
+    questao_id UUID NOT NULL,
+
+    alternativa_escolhida INTEGER NOT NULL,
+
+    acertou BOOLEAN NOT NULL,
+
+    respondido_em TIMESTAMP DEFAULT NOW(),
+
+    CONSTRAINT fk_sessao
+    FOREIGN KEY (sessao_id)
+    REFERENCES sessoes_simulado(id)
+    ON DELETE CASCADE,
+
+    CONSTRAINT fk_questao
+    FOREIGN KEY (questao_id)
+    REFERENCES questoes(id)
+    ON DELETE CASCADE,
+
+    CONSTRAINT unq_resposta
+    UNIQUE (sessao_id, questao_id)
+);
+
+-- TRIGGER PARA CRIAR PERFIL AUTOMATICAMENTE
+
+CREATE OR REPLACE FUNCTION criar_perfil_usuario()
+RETURNS TRIGGER AS $$
+BEGIN
+
+    INSERT INTO usuarios (
+        id,
+        nome_completo,
+        papel
+    )
+    VALUES (
+        NEW.id,
+        COALESCE(
+            NEW.raw_user_meta_data->>'nome_completo',
+            'Usuário'
+        ),
+        COALESCE(
+            NEW.raw_user_meta_data->>'papel',
+            'ALUNO'
+        )
+    );
+
+    RETURN NEW;
+
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_criar_perfil
+AFTER INSERT ON auth.users
+FOR EACH ROW
+EXECUTE FUNCTION criar_perfil_usuario();
+
+-- TRIGGER PARA ATUALIZAR ACERTOS
+
+CREATE OR REPLACE FUNCTION atualizar_estatisticas_sessao()
+RETURNS TRIGGER AS $$
+BEGIN
+
+    UPDATE sessoes_simulado
+    SET
+        total_questoes = total_questoes + 1,
+
+        total_acertos = total_acertos +
+        CASE
+            WHEN NEW.acertou = true THEN 1
+            ELSE 0
+        END
+
+    WHERE id = NEW.sessao_id;
+
+    RETURN NEW;
+
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_estatisticas
+AFTER INSERT ON respostas
+FOR EACH ROW
+EXECUTE FUNCTION atualizar_estatisticas_sessao();
+
+-- TRIGGER PARA VALIDAR ADMIN ESCOLAR
+
+CREATE OR REPLACE FUNCTION validar_admin_escolar()
+RETURNS TRIGGER AS $$
+DECLARE
+    tipo_usuario VARCHAR(30);
+BEGIN
+
+    SELECT papel
+    INTO tipo_usuario
+    FROM usuarios
+    WHERE id = NEW.administrador_id;
+
+    IF tipo_usuario <> 'ADMIN_ESCOLAR' THEN
+
+        RAISE EXCEPTION
+        'Usuário deve possuir papel ADMIN_ESCOLAR';
+
+    END IF;
+
+    RETURN NEW;
+
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_validar_admin
+BEFORE INSERT OR UPDATE ON escolas
+FOR EACH ROW
+EXECUTE FUNCTION validar_admin_escolar();
+
+-- RLS
+
+ALTER TABLE usuarios ENABLE ROW LEVEL SECURITY;
+ALTER TABLE escolas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE matriculas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE sessoes_simulado ENABLE ROW LEVEL SECURITY;
+ALTER TABLE respostas ENABLE ROW LEVEL SECURITY;
+ALTER TABLE questoes ENABLE ROW LEVEL SECURITY;
+
+-- USUÁRIO VÊ APENAS SEU PERFIL
+
+CREATE POLICY politica_usuario_perfil
+ON usuarios
+FOR ALL
+USING (
+    auth.uid() = id
+);
+
+-- ALUNO VÊ SUAS MATRÍCULAS
+
+CREATE POLICY politica_matriculas_aluno
+ON matriculas
+FOR SELECT
+USING (
+    auth.uid() = aluno_id
+);
+
+-- ALUNO VÊ SUAS SESSÕES
+
+CREATE POLICY politica_sessoes_aluno
+ON sessoes_simulado
+FOR ALL
+USING (
+    auth.uid() = aluno_id
+);
+
+-- ALUNO VÊ SUAS RESPOSTAS
+
+CREATE POLICY politica_respostas_aluno
+ON respostas
+FOR ALL
+USING (
+
+    EXISTS (
+        SELECT 1
+        FROM sessoes_simulado s
+        WHERE s.id = respostas.sessao_id
+        AND s.aluno_id = auth.uid()
+    )
+
+);
+
+-- QUESTÕES PODEM SER LIDAS
+
+CREATE POLICY politica_questoes
+ON questoes
+FOR SELECT
+USING (
+    auth.role() = 'authenticated'
+);
+
+-- ADMIN ESCOLAR GERENCIA SUA ESCOLA
+
+CREATE POLICY politica_admin_escola
+ON escolas
+FOR ALL
+USING (
+    administrador_id = auth.uid()
+);
+
+-- ADMIN ESCOLAR VÊ MATRÍCULAS DA ESCOLA
+
+CREATE POLICY politica_admin_matriculas
+ON matriculas
+FOR ALL
+USING (
+
+    EXISTS (
+        SELECT 1
+        FROM escolas e
+        WHERE e.id = matriculas.escola_id
+        AND e.administrador_id = auth.uid()
+    )
+
+);
+
+-- ADMIN ESCOLAR VÊ SESSÕES DOS ALUNOS
+
+CREATE POLICY politica_admin_sessoes
+ON sessoes_simulado
+FOR SELECT
+USING (
+
+    EXISTS (
+        SELECT 1
+        FROM matriculas m
+        JOIN escolas e
+        ON e.id = m.escola_id
+
+        WHERE m.aluno_id = sessoes_simulado.aluno_id
+        AND e.administrador_id = auth.uid()
+    )
+
+);
+
+-- ADMIN ESCOLAR VÊ RESPOSTAS DOS ALUNOS
+
+CREATE POLICY politica_admin_respostas
+ON respostas
+FOR SELECT
+USING (
+
+    EXISTS (
+        SELECT 1
+        FROM sessoes_simulado s
+        JOIN matriculas m
+        ON m.aluno_id = s.aluno_id
+
+        JOIN escolas e
+        ON e.id = m.escola_id
+
+        WHERE s.id = respostas.sessao_id
+        AND e.administrador_id = auth.uid()
+    )
+
+);
+
+-- INSERTS DE TESTE
+
+-- QUESTÃO EXEMPLO
+
+/*INSERT INTO questoes (
+    numero_identificacao,
+    enunciado,
+    alternativas,
+    alternativa_correta
+)
+VALUES (
+    1001,
+
+    '{
+        "texto": "Quanto é 2 + 2?"
+    }',
+
+    '[
+        {"numero": 1, "texto": "3"},
+        {"numero": 2, "texto": "4"},
+        {"numero": 3, "texto": "5"},
+        {"numero": 4, "texto": "6"}
+    ]',
+
+    2
+);
+*/
+--select * from questoes;
